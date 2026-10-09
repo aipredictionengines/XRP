@@ -1,0 +1,44 @@
+name: XRPL LAB-001 Live Testnet
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/lab001-live-testnet.yml"
+      - "labs/001-first-testnet-transaction/**"
+
+permissions:
+  contents: read
+
+jobs:
+  live-testnet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: labs/001-first-testnet-transaction
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install
+        run: npm install --ignore-scripts
+
+      - name: Run LAB-001 against XRPL Testnet
+        run: npm run lab
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrpl-lab-001-evidence
+          path: labs/001-first-testnet-transaction/artifacts/*.json
+          if-no-files-found: error
+          retention-days: 30
