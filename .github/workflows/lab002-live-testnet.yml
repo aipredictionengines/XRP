@@ -1,0 +1,40 @@
+name: XRPL LAB-002 Live Testnet
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/lab002-live-testnet.yml"
+      - "labs/002-account-transaction-intelligence/**"
+
+permissions:
+  contents: read
+
+jobs:
+  live-account-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: labs/002-account-transaction-intelligence
+    env:
+      XRPL_ACCOUNT: rQpW2bpG9mP6UP8WAfJvB2umrra5RjJNs2
+      XRPL_TX_LIMIT: "25"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --ignore-scripts
+      - name: Read XRPL Testnet account and export evidence
+        run: npm run lab
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrpl-lab-002-evidence
+          path: labs/002-account-transaction-intelligence/artifacts/*.json
+          if-no-files-found: error
+          retention-days: 30
