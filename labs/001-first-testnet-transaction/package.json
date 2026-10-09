@@ -1,0 +1,13 @@
+{
+  "name": "xrpl-lab-001-first-testnet-transaction",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reproducible XRPL Testnet payment experiment with sanitized JSON evidence.",
+  "scripts": {
+    "lab": "node src/index.mjs"
+  },
+  "dependencies": {
+    "xrpl": "^5.3.0"
+  }
+}

@@ -1,0 +1,37 @@
+name: XRPL Lab 001 CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - xrpl-lab-v0.1
+
+jobs:
+  syntax-and-install:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: labs/001-first-testnet-transaction
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependency
+        run: npm install --ignore-scripts
+
+      - name: Check JavaScript syntax
+        run: node --check src/index.mjs
+
+      - name: Safety check — no obvious seed persistence
+        run: |
+          if grep -RniE 'seed[[:space:]]*[:=]|private.?key[[:space:]]*[:=]' src; then
+            echo "Potential secret persistence pattern found."
+            exit 1
+          fi
