@@ -1,0 +1,31 @@
+name: XRPL LAB-002 CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/lab002-ci.yml"
+      - ".github/workflows/lab002-live-testnet.yml"
+      - "labs/002-account-transaction-intelligence/**"
+      - "evidence/LAB-001-PASS.md"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: labs/002-account-transaction-intelligence
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --ignore-scripts
+      - run: npm test
+      - run: node --check src/index.mjs
+      - run: node --check src/lib.mjs
