@@ -1,0 +1,570 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import xrpl from "xrpl";
+import {
+  extractCreditFeatures,
+  enhancedPaperRisk
+} from "./features.mjs";
+import {
+  binarySearchFirstTrue,
+  currentOutcome,
+  findLoanOrigin,
+  isAdverse,
+  metricSummary
+} from "./devnet50-lib.mjs";
+
+const DISCOVERY_WS =
+  process.env.XRPL_DISCOVERY_WS ?? "wss://s.devnet.rippletest.net:51233/";
+const HISTORY_WS =
+  process.env.XRPL_HISTORY_WS ?? "wss://clio.devnet.rippletest.net:51233/";
+const TARGET = Math.min(50, Math.max(1, Number(process.env.XRPL_COHORT_TARGET ?? "50")));
+const MAX_DISCOVERY_PAGES = Math.max(
+  1,
+  Number(process.env.XRPL_DISCOVERY_MAX_PAGES ?? "50")
+);
+const TX_PAGES = Math.max(1, Number(process.env.XRPL_TX_PAGES ?? "4"));
+const CONCURRENCY = Math.min(
+  8,
+  Math.max(1, Number(process.env.XRPL_COHORT_CONCURRENCY ?? "5"))
+);
+const BORROWER_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.XRPL_BORROWER_TIMEOUT_MS ?? "12000")
+);
+const CONNECT_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.XRPL_CONNECT_TIMEOUT_MS ?? "5000")
+);
+const ARTIFACT_DIR = path.resolve("artifacts");
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`TIMEOUT: ${label} exceeded ${ms}ms`)),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function rippleTimeToIso(seconds) {
+  if (seconds === undefined || seconds === null) return null;
+  return new Date((Number(seconds) + 946684800) * 1000).toISOString();
+}
+
+function normalizeAmount(amount) {
+  if (typeof amount === "string") {
+    return { type: "XRP", value_xrp: Number(amount) / 1_000_000 };
+  }
+  if (amount && typeof amount === "object") {
+    return {
+      type: "ISSUED_CURRENCY",
+      currency: amount.currency ?? null,
+      issuer: amount.issuer ?? null,
+      value: amount.value ?? null
+    };
+  }
+  return { type: "UNKNOWN" };
+}
+
+function normalizeTx(entry, subject) {
+  const tx = entry?.tx_json ?? entry?.tx ?? {};
+  const meta = entry?.meta ?? {};
+  let direction = "OTHER";
+  if (tx.Account === subject && tx.Destination === subject) direction = "SELF";
+  else if (tx.Account === subject) direction = "OUT";
+  else if (tx.Destination === subject) direction = "IN";
+  return {
+    hash: tx.hash ?? entry?.hash ?? null,
+    transaction_type: tx.TransactionType ?? null,
+    account: tx.Account ?? null,
+    destination: tx.Destination ?? null,
+    direction,
+    amount: normalizeAmount(tx.Amount),
+    validated: entry?.validated ?? null,
+    result_code:
+      typeof meta === "object" && meta !== null
+        ? meta.TransactionResult ?? null
+        : null,
+    ledger_index: entry?.ledger_index ?? tx.ledger_index ?? null,
+    timestamp: rippleTimeToIso(tx.date)
+  };
+}
+
+async function discoverLoans(client) {
+  const loans = [];
+  const seenBorrowers = new Set();
+  let marker;
+  let pages = 0;
+
+  do {
+    const response = await client.request({
+      command: "ledger_data",
+      ledger_index: "validated",
+      type: "Loan",
+      binary: false,
+      limit: 256,
+      ...(marker ? { marker } : {})
+    });
+
+    pages += 1;
+    for (const obj of response.result.state ?? []) {
+      if (obj?.LedgerEntryType !== "Loan") continue;
+      const borrower = obj.Borrower;
+      if (!borrower || seenBorrowers.has(borrower)) continue;
+      seenBorrowers.add(borrower);
+      loans.push(obj);
+      if (loans.length >= TARGET) {
+        return { loans, pages, complete: false };
+      }
+    }
+    marker = response.result.marker;
+  } while (marker && pages < MAX_DISCOVERY_PAGES);
+
+  return { loans, pages, complete: !marker };
+}
+
+async function accountTxAll(client, account, options = {}) {
+  const all = [];
+  let marker;
+  let pages = 0;
+
+  do {
+    const response = await client.request({
+      command: "account_tx",
+      account,
+      ledger_index_min: options.min ?? -1,
+      ledger_index_max: options.max ?? -1,
+      forward: options.forward ?? true,
+      limit: 200,
+      ...(marker ? { marker } : {})
+    });
+    all.push(...(response.result.transactions ?? []));
+    marker = response.result.marker;
+    pages += 1;
+  } while (marker && pages < (options.maxPages ?? TX_PAGES));
+
+  return {
+    transactions: all,
+    complete: !marker,
+    pages
+  };
+}
+
+
+function parseCompleteLedgers(value) {
+  const chunks = String(value ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const ranges = [];
+  for (const chunk of chunks) {
+    const [a, b] = chunk.split("-").map(Number);
+    if (Number.isInteger(a) && Number.isInteger(b)) ranges.push([a, b]);
+    else if (Number.isInteger(a)) ranges.push([a, a]);
+  }
+  return ranges;
+}
+
+async function availableLedgerBounds(client) {
+  const response = await client.request({ command: "server_info" });
+  const ranges = parseCompleteLedgers(response.result?.info?.complete_ledgers);
+  if (!ranges.length) return null;
+  return {
+    min: Math.min(...ranges.map(([a]) => a)),
+    max: Math.max(...ranges.map(([, b]) => b))
+  };
+}
+
+async function loanExistsAt(client, loanId, ledgerIndex) {
+  try {
+    await client.request({
+      command: "ledger_entry",
+      loan: loanId,
+      ledger_index: ledgerIndex
+    });
+    return true;
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    if (/entryNotFound|entry not found/i.test(message)) return false;
+    throw error;
+  }
+}
+
+async function findLoanBirthByLedger(client, loan) {
+  const loanId = loan.index ?? loan.LedgerIndex;
+  const bounds = await availableLedgerBounds(client);
+  if (!bounds) {
+    return { status: "HISTORY_BOUNDS_UNKNOWN" };
+  }
+
+  let upper = Number(loan.PreviousTxnLgrSeq);
+  if (!Number.isInteger(upper) || upper < bounds.min || upper > bounds.max) {
+    upper = bounds.max;
+  }
+
+  const existsAtUpper = await loanExistsAt(client, loanId, upper);
+  if (!existsAtUpper) {
+    upper = bounds.max;
+    if (!(await loanExistsAt(client, loanId, upper))) {
+      return { status: "LOAN_NOT_FOUND_IN_AVAILABLE_HISTORY", bounds };
+    }
+  }
+
+  if (await loanExistsAt(client, loanId, bounds.min)) {
+    return {
+      status: "ORIGIN_PREDATES_AVAILABLE_HISTORY",
+      bounds
+    };
+  }
+
+  const first = await binarySearchFirstTrue(
+    bounds.min,
+    upper,
+    (ledger) => loanExistsAt(client, loanId, ledger)
+  );
+
+  if (!first) return { status: "ORIGIN_BINARY_SEARCH_FAILED", bounds };
+
+  return {
+    status: "FOUND",
+    ledger_index: first,
+    bounds
+  };
+}
+
+async function accountObjectsAt(client, account, ledgerIndex) {
+  const all = [];
+  let marker;
+  let pages = 0;
+  do {
+    const response = await client.request({
+      command: "account_objects",
+      account,
+      ledger_index: ledgerIndex,
+      limit: 200,
+      ...(marker ? { marker } : {})
+    });
+    all.push(...(response.result.account_objects ?? []));
+    marker = response.result.marker;
+    pages += 1;
+  } while (marker && pages < 5);
+  return { objects: all, complete: !marker };
+}
+
+async function snapshotAtOrigin(historyClient, loan) {
+  const borrower = loan.Borrower;
+  const borrowerHistory = await accountTxAll(historyClient, borrower, {
+    forward: true,
+    maxPages: TX_PAGES
+  });
+  const loanId = loan.index ?? loan.LedgerIndex;
+  let origin = findLoanOrigin(borrowerHistory.transactions, loanId);
+  let originSource = origin ? "BORROWER_ACCOUNT_TX" : null;
+  let brokerOwner = null;
+  let brokerHistory = null;
+
+  if (!origin && loan.LoanBrokerID) {
+    try {
+      const brokerResponse = await historyClient.request({
+        command: "ledger_entry",
+        loan_broker: loan.LoanBrokerID,
+        ledger_index: "validated"
+      });
+      brokerOwner =
+        brokerResponse.result?.node?.Owner ??
+        brokerResponse.result?.node?.owner ??
+        null;
+
+      if (brokerOwner) {
+        brokerHistory = await accountTxAll(historyClient, brokerOwner, {
+          forward: true,
+          maxPages: Math.max(TX_PAGES, 8)
+        });
+        origin = findLoanOrigin(brokerHistory.transactions, loanId);
+        if (origin) originSource = "LOAN_BROKER_OWNER_ACCOUNT_TX";
+      }
+    } catch {
+      // Preserve the borrower-only result as UNKNOWN rather than inventing an origin.
+    }
+  }
+
+  let ledgerBirth = null;
+  if (!origin?.ledger_index) {
+    try {
+      ledgerBirth = await findLoanBirthByLedger(historyClient, loan);
+      if (ledgerBirth.status === "FOUND") {
+        origin = {
+          hash: null,
+          ledger_index: ledgerBirth.ledger_index,
+          date: null,
+          account: null,
+          counterparty: borrower,
+          loan_broker_id: loan.LoanBrokerID ?? null
+        };
+        originSource = "LEDGER_ENTRY_FIRST_EXISTENCE";
+      }
+    } catch (error) {
+      ledgerBirth = {
+        status: "LEDGER_BIRTH_LOOKUP_FAILED",
+        error: error?.message ?? String(error)
+      };
+    }
+  }
+
+  if (!origin?.ledger_index || origin.ledger_index <= 1) {
+    return {
+      borrower,
+      loan_id: loanId,
+      loan_broker_id: loan.LoanBrokerID ?? null,
+      loan_broker_owner: brokerOwner,
+      status: "ORIGIN_NOT_FOUND",
+      borrower_origin_search_complete: borrowerHistory.complete,
+      borrower_origin_search_pages: borrowerHistory.pages,
+      broker_origin_search_complete: brokerHistory?.complete ?? null,
+      broker_origin_search_pages: brokerHistory?.pages ?? null,
+      ledger_birth: ledgerBirth
+    };
+  }
+
+  const t0Ledger = Number(origin.ledger_index) - 1;
+
+  try {
+    const [infoResponse, t0Tx, objectsResponse] = await Promise.all([
+      historyClient.request({
+        command: "account_info",
+        account: borrower,
+        ledger_index: t0Ledger
+      }),
+      accountTxAll(historyClient, borrower, {
+        forward: false,
+        max: t0Ledger,
+        maxPages: TX_PAGES
+      }),
+      accountObjectsAt(historyClient, borrower, t0Ledger)
+    ]);
+
+    const accountEvidence = {
+      verification: "VERIFIED",
+      subject: { address: borrower },
+      account: {
+        balance_xrp:
+          Number(infoResponse.result.account_data.Balance) / 1_000_000,
+        owner_count: infoResponse.result.account_data.OwnerCount ?? null,
+        flags: infoResponse.result.account_data.Flags ?? null,
+        ledger_index: infoResponse.result.ledger_index ?? t0Ledger
+      },
+      transactions: t0Tx.transactions.map((entry) =>
+        normalizeTx(entry, borrower)
+      )
+    };
+
+    const features = extractCreditFeatures({
+      accountEvidence,
+      accountLines: [],
+      accountObjects: objectsResponse.objects
+    });
+    const assessment = enhancedPaperRisk(features);
+    const outcome = currentOutcome(loan);
+
+    return {
+      borrower,
+      loan_id: loanId,
+      status: "T0_RECONSTRUCTED",
+      outcome,
+      adverse: isAdverse(outcome),
+      origin,
+      origin_source: originSource,
+      loan_broker_id: loan.LoanBrokerID ?? null,
+      loan_broker_owner: brokerOwner,
+      t0_ledger: t0Ledger,
+      ledger_birth: ledgerBirth,
+      t0_coverage: {
+        borrower_origin_search_complete: borrowerHistory.complete,
+        borrower_origin_search_pages: borrowerHistory.pages,
+        broker_origin_search_complete: brokerHistory?.complete ?? null,
+        broker_origin_search_pages: brokerHistory?.pages ?? null,
+        t0_tx_complete: t0Tx.complete,
+        t0_objects_complete: objectsResponse.complete
+      },
+      baseline_activity_score: assessment.baseline_activity_score,
+      baseline_risk_score: 100 - assessment.baseline_activity_score,
+      enhanced_paper_risk_score: assessment.paper_risk_score,
+      enhanced_decision: assessment.decision,
+      t0_features: features
+    };
+  } catch (error) {
+    return {
+      borrower,
+      loan_id: loanId,
+      status: "T0_RECONSTRUCTION_FAILED",
+      origin,
+      t0_ledger: t0Ledger,
+      error: error?.message ?? String(error)
+    };
+  }
+}
+
+async function reconstructWithIsolatedClient(loan) {
+  const client = new xrpl.Client(HISTORY_WS);
+
+  try {
+    await withTimeout(
+      client.connect(),
+      CONNECT_TIMEOUT_MS,
+      `connect:${loan.Borrower ?? loan.index ?? "borrower"}`
+    );
+
+    return await withTimeout(
+      snapshotAtOrigin(client, loan),
+      BORROWER_TIMEOUT_MS,
+      loan.Borrower ?? loan.index ?? "borrower"
+    );
+  } catch (error) {
+    return {
+      borrower: loan.Borrower ?? null,
+      loan_id: loan.index ?? loan.LedgerIndex ?? null,
+      status: String(error?.message ?? "").startsWith("TIMEOUT:")
+        ? "T0_RECONSTRUCTION_TIMEOUT"
+        : "T0_RECONSTRUCTION_FAILED",
+      error: error?.message ?? String(error)
+    };
+  } finally {
+    if (client.isConnected()) {
+      try {
+        await withTimeout(client.disconnect(), 2000, "disconnect");
+      } catch {
+        // Best-effort cleanup. The per-borrower client is not reused.
+      }
+    }
+  }
+}
+
+async function main() {
+  const discovery = new xrpl.Client(DISCOVERY_WS);
+
+  await discovery.connect();
+
+  try {
+    const found = await discoverLoans(discovery);
+    const rows = [];
+
+    for (let offset = 0; offset < found.loans.length; offset += CONCURRENCY) {
+      const batch = found.loans.slice(offset, offset + CONCURRENCY);
+      const batchRows = await Promise.all(
+        batch.map((loan) => reconstructWithIsolatedClient(loan))
+      );
+
+      for (const row of batchRows) {
+        rows.push(row);
+        console.log(
+          `[${rows.length}/${found.loans.length}] ${row.borrower}: ${row.status}`
+        );
+      }
+    }
+
+    const reconstructed = rows.filter((r) => r.status === "T0_RECONSTRUCTED");
+    const adverse = reconstructed.filter((r) => r.adverse);
+
+    const baselineMetrics = metricSummary(
+      reconstructed,
+      "baseline_risk_score",
+      10
+    );
+    const enhancedMetrics = metricSummary(
+      reconstructed,
+      "enhanced_paper_risk_score",
+      10
+    );
+
+    const result = {
+      schema_version: "0.1",
+      experiment: "DEVNET_50_RETROSPECTIVE_T0",
+      observed_at: new Date().toISOString(),
+      environment: "XRPL Devnet",
+      discovery_server: DISCOVERY_WS,
+      history_server: HISTORY_WS,
+      target: TARGET,
+      discovery: {
+        loans_selected: found.loans.length,
+        pages_scanned: found.pages,
+        complete: found.complete
+      },
+      cohort: {
+        reconstructed: reconstructed.length,
+        origin_not_found: rows.filter((r) => r.status === "ORIGIN_NOT_FOUND").length,
+        origin_predates_available_history: rows.filter(
+          (r) =>
+            r.status === "ORIGIN_NOT_FOUND" &&
+            r.ledger_birth?.status === "ORIGIN_PREDATES_AVAILABLE_HISTORY"
+        ).length,
+        reconstruction_failed: rows.filter(
+          (r) => r.status === "T0_RECONSTRUCTION_FAILED"
+        ).length,
+        reconstruction_timeout: rows.filter(
+          (r) => r.status === "T0_RECONSTRUCTION_TIMEOUT"
+        ).length,
+        adverse_outcomes: adverse.length,
+        defaulted: reconstructed.filter((r) => r.outcome === "DEFAULTED").length,
+        impaired: reconstructed.filter((r) => r.outcome === "IMPAIRED").length
+      },
+      metrics: {
+        baseline: baselineMetrics,
+        enhanced: enhancedMetrics
+      },
+      information_edge_gate: {
+        passed: false,
+        reason:
+          "Devnet retrospective evidence is a technical benchmark with survivorship bias and too little real economic outcome evidence to establish production predictive edge."
+      },
+      limitations: [
+        "Devnet behavior is not real economic borrower behavior.",
+        "Only currently discoverable Loan objects are sampled; repaid/deleted loans may be absent.",
+        "Current loan state is used only as outcome label; T0 features are reconstructed from pre-origination ledger state.",
+        "Transaction/history pagination may be incomplete and is recorded per row.",
+        "No production credit decision is authorized by this experiment."
+      ],
+      rows
+    };
+
+    await fs.mkdir(ARTIFACT_DIR, { recursive: true });
+    const file = path.join(
+      ARTIFACT_DIR,
+      `lab-003c-devnet50-${Date.now()}.json`
+    );
+    await fs.writeFile(file, JSON.stringify(result, null, 2), "utf8");
+
+    console.log("\n=== DEVNET 50 RESULT ===");
+    console.log(`Selected: ${found.loans.length}`);
+    console.log(`T0 reconstructed: ${reconstructed.length}`);
+    console.log(`Adverse outcomes: ${adverse.length}`);
+    console.log(
+      `Origin predates available history: ${
+        rows.filter(
+          (r) => r.ledger_birth?.status === "ORIGIN_PREDATES_AVAILABLE_HISTORY"
+        ).length
+      }`
+    );
+    console.log(
+      `Baseline top-10 adverse recall: ${baselineMetrics.top_k_adverse_recall}`
+    );
+    console.log(
+      `Enhanced top-10 adverse recall: ${enhancedMetrics.top_k_adverse_recall}`
+    );
+    console.log("Information edge gate: NOT PASSED");
+    console.log(`Evidence: ${file}`);
+
+    if (found.loans.length < Math.min(TARGET, 10)) {
+      process.exitCode = 2;
+    }
+  } finally {
+    if (discovery.isConnected()) await discovery.disconnect();
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
