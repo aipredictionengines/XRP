@@ -495,6 +495,11 @@ async function main() {
       cohort: {
         reconstructed: reconstructed.length,
         origin_not_found: rows.filter((r) => r.status === "ORIGIN_NOT_FOUND").length,
+        origin_predates_available_history: rows.filter(
+          (r) =>
+            r.status === "ORIGIN_NOT_FOUND" &&
+            r.ledger_birth?.status === "ORIGIN_PREDATES_AVAILABLE_HISTORY"
+        ).length,
         reconstruction_failed: rows.filter(
           (r) => r.status === "T0_RECONSTRUCTION_FAILED"
         ).length,
@@ -535,6 +540,13 @@ async function main() {
     console.log(`Selected: ${found.loans.length}`);
     console.log(`T0 reconstructed: ${reconstructed.length}`);
     console.log(`Adverse outcomes: ${adverse.length}`);
+    console.log(
+      `Origin predates available history: ${
+        rows.filter(
+          (r) => r.ledger_birth?.status === "ORIGIN_PREDATES_AVAILABLE_HISTORY"
+        ).length
+      }`
+    );
     console.log(
       `Baseline top-10 adverse recall: ${baselineMetrics.top_k_adverse_recall}`
     );
