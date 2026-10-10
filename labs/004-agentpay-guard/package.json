@@ -1,0 +1,14 @@
+{
+  "name": "xrpl-lab-004-agentpay-guard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Policy-first guard for XRPL agent and X402 payment intents.",
+  "scripts": {
+    "test": "node --test",
+    "live": "node src/live-testnet.mjs"
+  },
+  "dependencies": {
+    "xrpl": "^5.3.0"
+  }
+}
