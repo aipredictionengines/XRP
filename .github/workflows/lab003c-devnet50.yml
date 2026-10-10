@@ -23,7 +23,7 @@ jobs:
         working-directory: labs/003-credit-risk-adapter
     env:
       XRPL_DISCOVERY_WS: wss://s.devnet.rippletest.net:51233/
-      XRPL_HISTORY_WS: wss://clio.devnet.rippletest.net:51233/
+      XRPL_HISTORY_WS: wss://s.devnet.rippletest.net:51233/
       XRPL_COHORT_TARGET: "50"
       XRPL_DISCOVERY_MAX_PAGES: "50"
       XRPL_TX_PAGES: "4"
