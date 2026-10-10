@@ -1,0 +1,29 @@
+name: XRPL LAB-004 CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/lab004-ci.yml"
+      - ".github/workflows/lab004-live-testnet.yml"
+      - "labs/004-agentpay-guard/**"
+      - "docs/LAB-004-AGENTPAY-CONTRACT.md"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: labs/004-agentpay-guard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --ignore-scripts
+      - run: npm test
+      - run: node --check src/policy.mjs
+      - run: node --check src/live-testnet.mjs
