@@ -1,0 +1,47 @@
+name: XRPL LAB-003C DEVNET 50
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/lab003c-devnet50.yml"
+      - "labs/003-credit-risk-adapter/src/devnet50.mjs"
+      - "labs/003-credit-risk-adapter/src/devnet50-lib.mjs"
+      - "labs/003-credit-risk-adapter/test/devnet50.test.mjs"
+      - "labs/003-credit-risk-adapter/package.json"
+      - "docs/LAB-003C-DEVNET-50-CONTRACT.md"
+
+permissions:
+  contents: read
+
+jobs:
+  retrospective:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: labs/003-credit-risk-adapter
+    env:
+      XRPL_DISCOVERY_WS: wss://s.devnet.rippletest.net:51233/
+      XRPL_HISTORY_WS: wss://clio.devnet.rippletest.net:51233/
+      XRPL_COHORT_TARGET: "50"
+      XRPL_DISCOVERY_MAX_PAGES: "50"
+      XRPL_TX_PAGES: "8"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --ignore-scripts
+      - run: npm test
+      - name: Run DEVNET 50 retrospective T0 cohort
+        run: npm run devnet50
+      - name: Upload cohort evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrpl-lab-003c-devnet50
+          path: labs/003-credit-risk-adapter/artifacts/*.json
+          if-no-files-found: error
+          retention-days: 30
