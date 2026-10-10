@@ -26,7 +26,9 @@ jobs:
       XRPL_HISTORY_WS: wss://clio.devnet.rippletest.net:51233/
       XRPL_COHORT_TARGET: "50"
       XRPL_DISCOVERY_MAX_PAGES: "50"
-      XRPL_TX_PAGES: "8"
+      XRPL_TX_PAGES: "4"
+      XRPL_COHORT_CONCURRENCY: "3"
+      XRPL_BORROWER_TIMEOUT_MS: "20000"
 
     steps:
       - uses: actions/checkout@v4
