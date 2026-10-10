@@ -1,0 +1,44 @@
+name: XRPL LAB-003B Mainnet Loan Discovery
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/lab003b-mainnet-discovery.yml"
+      - "labs/003-credit-risk-adapter/src/discover-loans.mjs"
+      - "labs/003-credit-risk-adapter/test/discovery.test.mjs"
+      - "docs/LAB-003B-REAL-COHORT-PLAN.md"
+      - "evidence/LAB-003A-PASS.md"
+
+permissions:
+  contents: read
+
+jobs:
+  bounded-mainnet-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: labs/003-credit-risk-adapter
+    env:
+      XRPL_WS: wss://xrplcluster.com/
+      XRPL_DISCOVERY_MAX_PAGES: "20"
+      XRPL_DISCOVERY_LIMIT: "256"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --ignore-scripts
+      - run: npm test
+      - name: Run bounded Mainnet Loan discovery
+        run: node src/discover-loans.mjs
+      - name: Upload discovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrpl-lab-003b-mainnet-discovery
+          path: labs/003-credit-risk-adapter/artifacts/*.json
+          if-no-files-found: error
+          retention-days: 30
