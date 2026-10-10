@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  binarySearchFirstTrue,
   createdLoanId,
   currentOutcome,
   findLoanOrigin,
@@ -55,4 +56,13 @@ test("metric summary computes top-k adverse recall", () => {
   assert.equal(m.adverse, 2);
   assert.equal(m.adverse_in_top_k, 1);
   assert.equal(m.top_k_adverse_recall, 0.5);
+});
+
+test("binary search finds first true without inspecting outcomes", async () => {
+  const first = await binarySearchFirstTrue(
+    1,
+    100,
+    async (ledger) => ledger >= 37
+  );
+  assert.equal(first, 37);
 });
