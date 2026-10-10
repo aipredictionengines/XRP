@@ -27,8 +27,9 @@ jobs:
       XRPL_COHORT_TARGET: "50"
       XRPL_DISCOVERY_MAX_PAGES: "50"
       XRPL_TX_PAGES: "4"
-      XRPL_COHORT_CONCURRENCY: "3"
-      XRPL_BORROWER_TIMEOUT_MS: "20000"
+      XRPL_COHORT_CONCURRENCY: "5"
+      XRPL_BORROWER_TIMEOUT_MS: "12000"
+      XRPL_CONNECT_TIMEOUT_MS: "5000"
 
     steps:
       - uses: actions/checkout@v4
