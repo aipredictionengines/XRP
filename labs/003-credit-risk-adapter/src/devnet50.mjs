@@ -6,6 +6,7 @@ import {
   enhancedPaperRisk
 } from "./features.mjs";
 import {
+  binarySearchFirstTrue,
   currentOutcome,
   findLoanOrigin,
   isAdverse,
@@ -151,6 +152,89 @@ async function accountTxAll(client, account, options = {}) {
   };
 }
 
+
+function parseCompleteLedgers(value) {
+  const chunks = String(value ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const ranges = [];
+  for (const chunk of chunks) {
+    const [a, b] = chunk.split("-").map(Number);
+    if (Number.isInteger(a) && Number.isInteger(b)) ranges.push([a, b]);
+    else if (Number.isInteger(a)) ranges.push([a, a]);
+  }
+  return ranges;
+}
+
+async function availableLedgerBounds(client) {
+  const response = await client.request({ command: "server_info" });
+  const ranges = parseCompleteLedgers(response.result?.info?.complete_ledgers);
+  if (!ranges.length) return null;
+  return {
+    min: Math.min(...ranges.map(([a]) => a)),
+    max: Math.max(...ranges.map(([, b]) => b))
+  };
+}
+
+async function loanExistsAt(client, loanId, ledgerIndex) {
+  try {
+    await client.request({
+      command: "ledger_entry",
+      loan: loanId,
+      ledger_index: ledgerIndex
+    });
+    return true;
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    if (/entryNotFound|entry not found/i.test(message)) return false;
+    throw error;
+  }
+}
+
+async function findLoanBirthByLedger(client, loan) {
+  const loanId = loan.index ?? loan.LedgerIndex;
+  const bounds = await availableLedgerBounds(client);
+  if (!bounds) {
+    return { status: "HISTORY_BOUNDS_UNKNOWN" };
+  }
+
+  let upper = Number(loan.PreviousTxnLgrSeq);
+  if (!Number.isInteger(upper) || upper < bounds.min || upper > bounds.max) {
+    upper = bounds.max;
+  }
+
+  const existsAtUpper = await loanExistsAt(client, loanId, upper);
+  if (!existsAtUpper) {
+    upper = bounds.max;
+    if (!(await loanExistsAt(client, loanId, upper))) {
+      return { status: "LOAN_NOT_FOUND_IN_AVAILABLE_HISTORY", bounds };
+    }
+  }
+
+  if (await loanExistsAt(client, loanId, bounds.min)) {
+    return {
+      status: "ORIGIN_PREDATES_AVAILABLE_HISTORY",
+      bounds
+    };
+  }
+
+  const first = await binarySearchFirstTrue(
+    bounds.min,
+    upper,
+    (ledger) => loanExistsAt(client, loanId, ledger)
+  );
+
+  if (!first) return { status: "ORIGIN_BINARY_SEARCH_FAILED", bounds };
+
+  return {
+    status: "FOUND",
+    ledger_index: first,
+    bounds
+  };
+}
+
 async function accountObjectsAt(client, account, ledgerIndex) {
   const all = [];
   let marker;
@@ -207,6 +291,29 @@ async function snapshotAtOrigin(historyClient, loan) {
     }
   }
 
+  let ledgerBirth = null;
+  if (!origin?.ledger_index) {
+    try {
+      ledgerBirth = await findLoanBirthByLedger(historyClient, loan);
+      if (ledgerBirth.status === "FOUND") {
+        origin = {
+          hash: null,
+          ledger_index: ledgerBirth.ledger_index,
+          date: null,
+          account: null,
+          counterparty: borrower,
+          loan_broker_id: loan.LoanBrokerID ?? null
+        };
+        originSource = "LEDGER_ENTRY_FIRST_EXISTENCE";
+      }
+    } catch (error) {
+      ledgerBirth = {
+        status: "LEDGER_BIRTH_LOOKUP_FAILED",
+        error: error?.message ?? String(error)
+      };
+    }
+  }
+
   if (!origin?.ledger_index || origin.ledger_index <= 1) {
     return {
       borrower,
@@ -217,7 +324,8 @@ async function snapshotAtOrigin(historyClient, loan) {
       borrower_origin_search_complete: borrowerHistory.complete,
       borrower_origin_search_pages: borrowerHistory.pages,
       broker_origin_search_complete: brokerHistory?.complete ?? null,
-      broker_origin_search_pages: brokerHistory?.pages ?? null
+      broker_origin_search_pages: brokerHistory?.pages ?? null,
+      ledger_birth: ledgerBirth
     };
   }
 
@@ -272,6 +380,7 @@ async function snapshotAtOrigin(historyClient, loan) {
       loan_broker_id: loan.LoanBrokerID ?? null,
       loan_broker_owner: brokerOwner,
       t0_ledger: t0Ledger,
+      ledger_birth: ledgerBirth,
       t0_coverage: {
         borrower_origin_search_complete: borrowerHistory.complete,
         borrower_origin_search_pages: borrowerHistory.pages,
