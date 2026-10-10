@@ -21,8 +21,27 @@ const MAX_DISCOVERY_PAGES = Math.max(
   1,
   Number(process.env.XRPL_DISCOVERY_MAX_PAGES ?? "50")
 );
-const TX_PAGES = Math.max(1, Number(process.env.XRPL_TX_PAGES ?? "8"));
+const TX_PAGES = Math.max(1, Number(process.env.XRPL_TX_PAGES ?? "4"));
+const CONCURRENCY = Math.min(
+  5,
+  Math.max(1, Number(process.env.XRPL_COHORT_CONCURRENCY ?? "3"))
+);
+const BORROWER_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.XRPL_BORROWER_TIMEOUT_MS ?? "20000")
+);
 const ARTIFACT_DIR = path.resolve("artifacts");
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`TIMEOUT: ${label} exceeded ${ms}ms`)),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 function rippleTimeToIso(seconds) {
   if (seconds === undefined || seconds === null) return null;
@@ -248,12 +267,33 @@ async function main() {
     const found = await discoverLoans(discovery);
     const rows = [];
 
-    for (let i = 0; i < found.loans.length; i += 1) {
-      const row = await snapshotAtOrigin(history, found.loans[i]);
-      rows.push(row);
-      console.log(
-        `[${i + 1}/${found.loans.length}] ${row.borrower}: ${row.status}`
+    for (let offset = 0; offset < found.loans.length; offset += CONCURRENCY) {
+      const batch = found.loans.slice(offset, offset + CONCURRENCY);
+      const batchRows = await Promise.all(
+        batch.map(async (loan) => {
+          try {
+            return await withTimeout(
+              snapshotAtOrigin(history, loan),
+              BORROWER_TIMEOUT_MS,
+              loan.Borrower ?? loan.index ?? "borrower"
+            );
+          } catch (error) {
+            return {
+              borrower: loan.Borrower ?? null,
+              loan_id: loan.index ?? loan.LedgerIndex ?? null,
+              status: "T0_RECONSTRUCTION_TIMEOUT",
+              error: error?.message ?? String(error)
+            };
+          }
+        })
       );
+
+      for (const row of batchRows) {
+        rows.push(row);
+        console.log(
+          `[${rows.length}/${found.loans.length}] ${row.borrower}: ${row.status}`
+        );
+      }
     }
 
     const reconstructed = rows.filter((r) => r.status === "T0_RECONSTRUCTED");
@@ -288,6 +328,9 @@ async function main() {
         origin_not_found: rows.filter((r) => r.status === "ORIGIN_NOT_FOUND").length,
         reconstruction_failed: rows.filter(
           (r) => r.status === "T0_RECONSTRUCTION_FAILED"
+        ).length,
+        reconstruction_timeout: rows.filter(
+          (r) => r.status === "T0_RECONSTRUCTION_TIMEOUT"
         ).length,
         adverse_outcomes: adverse.length,
         defaulted: reconstructed.filter((r) => r.outcome === "DEFAULTED").length,
