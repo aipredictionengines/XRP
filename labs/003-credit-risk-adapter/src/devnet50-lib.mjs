@@ -70,3 +70,20 @@ export function metricSummary(rows, scoreKey, topK = 10) {
       adverse.length > 0 ? adverseInTop / adverse.length : null
   };
 }
+
+export async function binarySearchFirstTrue(low, high, predicate) {
+  let lo = Number(low);
+  let hi = Number(high);
+
+  if (!Number.isInteger(lo) || !Number.isInteger(hi) || lo > hi) {
+    throw new Error("Invalid binary-search bounds.");
+  }
+
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (await predicate(mid)) hi = mid;
+    else lo = mid + 1;
+  }
+
+  return (await predicate(lo)) ? lo : null;
+}
