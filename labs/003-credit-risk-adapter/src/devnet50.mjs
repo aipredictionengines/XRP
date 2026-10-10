@@ -172,20 +172,52 @@ async function accountObjectsAt(client, account, ledgerIndex) {
 
 async function snapshotAtOrigin(historyClient, loan) {
   const borrower = loan.Borrower;
-  const txHistory = await accountTxAll(historyClient, borrower, {
+  const borrowerHistory = await accountTxAll(historyClient, borrower, {
     forward: true,
     maxPages: TX_PAGES
   });
   const loanId = loan.index ?? loan.LedgerIndex;
-  const origin = findLoanOrigin(txHistory.transactions, loanId);
+  let origin = findLoanOrigin(borrowerHistory.transactions, loanId);
+  let originSource = origin ? "BORROWER_ACCOUNT_TX" : null;
+  let brokerOwner = null;
+  let brokerHistory = null;
+
+  if (!origin && loan.LoanBrokerID) {
+    try {
+      const brokerResponse = await historyClient.request({
+        command: "ledger_entry",
+        loan_broker: loan.LoanBrokerID,
+        ledger_index: "validated"
+      });
+      brokerOwner =
+        brokerResponse.result?.node?.Owner ??
+        brokerResponse.result?.node?.owner ??
+        null;
+
+      if (brokerOwner) {
+        brokerHistory = await accountTxAll(historyClient, brokerOwner, {
+          forward: true,
+          maxPages: Math.max(TX_PAGES, 8)
+        });
+        origin = findLoanOrigin(brokerHistory.transactions, loanId);
+        if (origin) originSource = "LOAN_BROKER_OWNER_ACCOUNT_TX";
+      }
+    } catch {
+      // Preserve the borrower-only result as UNKNOWN rather than inventing an origin.
+    }
+  }
 
   if (!origin?.ledger_index || origin.ledger_index <= 1) {
     return {
       borrower,
       loan_id: loanId,
+      loan_broker_id: loan.LoanBrokerID ?? null,
+      loan_broker_owner: brokerOwner,
       status: "ORIGIN_NOT_FOUND",
-      origin_search_complete: txHistory.complete,
-      origin_search_pages: txHistory.pages
+      borrower_origin_search_complete: borrowerHistory.complete,
+      borrower_origin_search_pages: borrowerHistory.pages,
+      broker_origin_search_complete: brokerHistory?.complete ?? null,
+      broker_origin_search_pages: brokerHistory?.pages ?? null
     };
   }
 
@@ -236,9 +268,15 @@ async function snapshotAtOrigin(historyClient, loan) {
       outcome,
       adverse: isAdverse(outcome),
       origin,
+      origin_source: originSource,
+      loan_broker_id: loan.LoanBrokerID ?? null,
+      loan_broker_owner: brokerOwner,
       t0_ledger: t0Ledger,
       t0_coverage: {
-        origin_search_complete: txHistory.complete,
+        borrower_origin_search_complete: borrowerHistory.complete,
+        borrower_origin_search_pages: borrowerHistory.pages,
+        broker_origin_search_complete: brokerHistory?.complete ?? null,
+        broker_origin_search_pages: brokerHistory?.pages ?? null,
         t0_tx_complete: t0Tx.complete,
         t0_objects_complete: objectsResponse.complete
       },
