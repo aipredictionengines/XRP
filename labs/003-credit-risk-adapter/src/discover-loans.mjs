@@ -129,7 +129,7 @@ async function main() {
 
     let status;
     if (baseProtocolVerifiedDisabled) {
-      status = "PROTOCOL_DISABLED_NO_MAINNET_COHORT";
+      status = "PROTOCOL_DISABLED_NO_ONLEDGER_COHORT";
     } else if (loans.length > 0) {
       status = "CANDIDATES_FOUND";
     } else if (complete) {
