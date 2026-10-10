@@ -23,12 +23,16 @@ const MAX_DISCOVERY_PAGES = Math.max(
 );
 const TX_PAGES = Math.max(1, Number(process.env.XRPL_TX_PAGES ?? "4"));
 const CONCURRENCY = Math.min(
-  5,
-  Math.max(1, Number(process.env.XRPL_COHORT_CONCURRENCY ?? "3"))
+  8,
+  Math.max(1, Number(process.env.XRPL_COHORT_CONCURRENCY ?? "5"))
 );
 const BORROWER_TIMEOUT_MS = Math.max(
   5000,
-  Number(process.env.XRPL_BORROWER_TIMEOUT_MS ?? "20000")
+  Number(process.env.XRPL_BORROWER_TIMEOUT_MS ?? "12000")
+);
+const CONNECT_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.XRPL_CONNECT_TIMEOUT_MS ?? "5000")
 );
 const ARTIFACT_DIR = path.resolve("artifacts");
 
@@ -256,12 +260,45 @@ async function snapshotAtOrigin(historyClient, loan) {
   }
 }
 
+async function reconstructWithIsolatedClient(loan) {
+  const client = new xrpl.Client(HISTORY_WS);
+
+  try {
+    await withTimeout(
+      client.connect(),
+      CONNECT_TIMEOUT_MS,
+      `connect:${loan.Borrower ?? loan.index ?? "borrower"}`
+    );
+
+    return await withTimeout(
+      snapshotAtOrigin(client, loan),
+      BORROWER_TIMEOUT_MS,
+      loan.Borrower ?? loan.index ?? "borrower"
+    );
+  } catch (error) {
+    return {
+      borrower: loan.Borrower ?? null,
+      loan_id: loan.index ?? loan.LedgerIndex ?? null,
+      status: String(error?.message ?? "").startsWith("TIMEOUT:")
+        ? "T0_RECONSTRUCTION_TIMEOUT"
+        : "T0_RECONSTRUCTION_FAILED",
+      error: error?.message ?? String(error)
+    };
+  } finally {
+    if (client.isConnected()) {
+      try {
+        await withTimeout(client.disconnect(), 2000, "disconnect");
+      } catch {
+        // Best-effort cleanup. The per-borrower client is not reused.
+      }
+    }
+  }
+}
+
 async function main() {
   const discovery = new xrpl.Client(DISCOVERY_WS);
-  const history = new xrpl.Client(HISTORY_WS);
 
   await discovery.connect();
-  await history.connect();
 
   try {
     const found = await discoverLoans(discovery);
@@ -270,22 +307,7 @@ async function main() {
     for (let offset = 0; offset < found.loans.length; offset += CONCURRENCY) {
       const batch = found.loans.slice(offset, offset + CONCURRENCY);
       const batchRows = await Promise.all(
-        batch.map(async (loan) => {
-          try {
-            return await withTimeout(
-              snapshotAtOrigin(history, loan),
-              BORROWER_TIMEOUT_MS,
-              loan.Borrower ?? loan.index ?? "borrower"
-            );
-          } catch (error) {
-            return {
-              borrower: loan.Borrower ?? null,
-              loan_id: loan.index ?? loan.LedgerIndex ?? null,
-              status: "T0_RECONSTRUCTION_TIMEOUT",
-              error: error?.message ?? String(error)
-            };
-          }
-        })
+        batch.map((loan) => reconstructWithIsolatedClient(loan))
       );
 
       for (const row of batchRows) {
@@ -380,7 +402,6 @@ async function main() {
     }
   } finally {
     if (discovery.isConnected()) await discovery.disconnect();
-    if (history.isConnected()) await history.disconnect();
   }
 }
 
